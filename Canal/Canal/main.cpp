@@ -4,7 +4,7 @@
 **	75.12 Análisis Numérico I
 **	Trabajo Práctico 2
 **	Curso 3
-**	26/11/2016
+**	30/11/2016
 **
 **	Merlo Leiva Nahuel
 **	Padrón 92115
@@ -55,7 +55,6 @@ const auto Kv_table_size = sizeof(Kv_table) / sizeof(Kv_table[0]);
 
 struct SOLVE_CONTEXT
 {
-	REAL tap = 0;
 	REAL t = 0;
 	REAL k = 0;
 	REAL H_1_n = 0;
@@ -97,6 +96,14 @@ struct SIMULATION_STEP
 	REAL time = 0;
 	REAL H_1 = 0;
 	REAL H_2 = 0;
+	REAL Q = 0;
+};
+
+struct TEST_STEP
+{
+	REAL time = 0;
+	REAL H_1 = 0;
+	REAL H_2 = 0;
 };
 
 struct SIMULATION_RESULT
@@ -110,12 +117,13 @@ struct SIMULATION_RESULT
 		return steps.back().time;
 	}
 
-	void AddStep(REAL time, REAL H_1, REAL H_2)
+	void AddStep(REAL time, REAL H_1, REAL H_2, REAL Q)
 	{
 		SIMULATION_STEP step;
 		step.time = time;
 		step.H_1 = H_1;
 		step.H_2 = H_2;
+		step.Q = Q;
 		steps.push_back(step);
 
 		if (H_2 > H_2_max)
@@ -137,8 +145,9 @@ struct SIMULATION_CONTEXT
 	SIMULATION_RESULT result;
 	CANAL_CONTEXT canalContext;
 	REAL openTime = 0;
-	REAL oscillationTime = 0;
+	REAL closeStartTime = 0;
 	REAL closeTime = 0;
+	REAL timeLimit = 0;
 	REAL maxOscillationAmplitude = 0;
 	REAL startStep = 0;
 	REAL maxTruncationError = 0;
@@ -148,6 +157,16 @@ struct SIMULATION_CONTEXT
 
 REAL ComputeKv(REAL openPercent)
 {
+	if (openPercent > 1)
+	{
+		return Kv_table[Kv_table_size - 1].second;
+	}
+
+	if (openPercent < 0)
+	{
+		return Kv_table[0].second;
+	}
+
 	for (size_t i = 0; i < Kv_table_size; i++)
 	{
 		if (openPercent == Kv_table[i].first)
@@ -163,8 +182,7 @@ REAL ComputeKv(REAL openPercent)
 		}
 	}
 
-	// openPercent > 1: return minimum Kv
-	return Kv_table[Kv_table_size - 1].second;
+	return 0;
 }
 
 void CanalSolveRK2Step(CANAL_CONTEXT& c, SOLVE_CONTEXT& s)
@@ -215,7 +233,6 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 	solveContext.const_1 = (canalContext.g * canalContext.A) / canalContext.L;
 	solveContext.const_2 = canalContext.f / (2.0 * canalContext.D_e * canalContext.A);
 	solveContext.const_3 = canalContext.K_e / (2.0 * canalContext.A * canalContext.L);
-	solveContext.tap = simulation.openTime; // s
 	solveContext.k = simulation.startStep; // s
 	
 	simulation.result.Reset(solveContext.k);
@@ -230,45 +247,68 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 		solveContext.H_2_delta = solveContext.H_2_n_1 - solveContext.H_2_n; // m
 
 		truncationErrorBelowMax = true;
-		bool openTimeHit = solveContext.t >= solveContext.tap;
+		bool openTimeHit = solveContext.t >= simulation.openTime;
 		bool oscillationHit = solveContext.H_1_n < solveContext.H_2_n;
 		bool stableOscillationHit = abs(solveContext.H_1_n - solveContext.H_2_n) < simulation.maxOscillationAmplitude;
-		while (truncationErrorBelowMax &&
+		bool timeLimitHit = simulation.timeLimit ? solveContext.t >= simulation.timeLimit : false;
+		while (!timeLimitHit &&
+			truncationErrorBelowMax &&
 			(!openTimeHit ||
 			!oscillationHit ||
 			!stableOscillationHit))
 		{
-			if (solveContext.t <= solveContext.tap)
+			if (solveContext.t <= simulation.openTime)
 			{
-				REAL Kv_n = ComputeKv(solveContext.t / solveContext.tap);
-				REAL Kv_n_1 = ComputeKv((solveContext.t + solveContext.k) / solveContext.tap);
+				REAL Kv_n = ComputeKv(solveContext.t / simulation.openTime);
+				REAL Kv_n_1 = ComputeKv((solveContext.t + solveContext.k) / simulation.openTime);
+				solveContext.var_1 = Kv_n / (2.0 * canalContext.A * canalContext.L);
+				solveContext.var_2 = Kv_n_1 / (2.0 * canalContext.A * canalContext.L);
+			}
+			else if (solveContext.t >= simulation.closeStartTime &&
+				solveContext.t <= (simulation.closeStartTime + simulation.closeTime))
+			{
+				REAL closeTimeLeft = simulation.closeTime - (solveContext.t - simulation.closeStartTime);
+				REAL Kv_n = ComputeKv(closeTimeLeft / simulation.closeTime);
+				REAL Kv_n_1 = ComputeKv((closeTimeLeft - solveContext.k) / simulation.closeTime);
 				solveContext.var_1 = Kv_n / (2.0 * canalContext.A * canalContext.L);
 				solveContext.var_2 = Kv_n_1 / (2.0 * canalContext.A * canalContext.L);
 			}
 
 			CanalSolveRK2Step(canalContext, solveContext);
 
-			simulation.result.AddStep(solveContext.t, solveContext.H_1_n, solveContext.H_2_n);
+			simulation.result.AddStep(solveContext.t, solveContext.H_1_n, solveContext.H_2_n, solveContext.Q_n);
 
-			REAL truncationErrorH_1 = abs(solveContext.H_1_n_1 - solveContext.H_1_n);
-			REAL truncationErrorH_2 = abs(solveContext.H_2_n_1 - solveContext.H_2_n);
-			if (truncationErrorH_1 > simulation.maxTruncationError ||
-				truncationErrorH_2 > simulation.maxTruncationError)
+			if (simulation.maxTruncationError)
 			{
-				truncationErrorBelowMax = false;
-				solveContext.k /= 2;
-				simulation.result.Reset(solveContext.k);
+				REAL truncationErrorH_1 = abs(solveContext.H_1_n_1 - solveContext.H_1_n);
+				REAL truncationErrorH_2 = abs(solveContext.H_2_n_1 - solveContext.H_2_n);
+				if (truncationErrorH_1 > simulation.maxTruncationError ||
+					truncationErrorH_2 > simulation.maxTruncationError)
+				{
+					truncationErrorBelowMax = false;
+					solveContext.k /= 2;
+					simulation.result.Reset(solveContext.k);
+				}
+				else
+				{
+					truncationErrorBelowMax = true;
+				}
 			}
 			else
 			{
 				truncationErrorBelowMax = true;
-
+			}
+	
+			if (truncationErrorBelowMax)
+			{
 				if (!openTimeHit)
 				{
-					openTimeHit = solveContext.t >= solveContext.tap;
+					openTimeHit = solveContext.t >= simulation.openTime;
 				}
 				else
 				{
+					timeLimitHit = simulation.timeLimit ? solveContext.t >= simulation.timeLimit : false;
+
 					if (solveContext.H_2_delta < 0 &&
 						solveContext.H_2_n_1 > solveContext.H_2_n)
 					{
@@ -290,6 +330,7 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 					}
 				}
 
+				// Move to next step
 				solveContext.H_2_delta = solveContext.H_2_n_1 - solveContext.H_2_n;
 				solveContext.H_1_n = solveContext.H_1_n_1;
 				solveContext.H_2_n = solveContext.H_2_n_1;
@@ -298,6 +339,113 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 			}
 		}
 	}
+}
+
+void SplitCSV(std::vector<std::string>& values, const std::string& line)
+{
+	std::string buff;
+	for each (auto c in line)
+	{
+		if (c == ';')
+		{
+			values.push_back(buff);
+			buff.clear();
+		}
+		else
+		{
+			buff += c;
+		}
+	}
+	values.push_back(buff);
+}
+
+void RunKeAdjustment(SIMULATION_CONTEXT& simulation, std::string testFileName)
+{
+	std::fstream file;
+	std::vector<TEST_STEP> testSteps;
+	file.open(testFileName, std::ios_base::in);
+	std::string line;
+	if (std::getline(file, line))
+	{
+		std::vector<std::string> values;
+		SplitCSV(values, line);
+		simulation.openTime = std::stod(values.at(0));
+		simulation.closeStartTime = std::stod(values.at(1));
+		simulation.closeTime = std::stod(values.at(2));
+	}
+	while (std::getline(file, line))
+	{
+		std::vector<std::string> values;
+		SplitCSV(values, line);
+		TEST_STEP step;
+		step.time = std::stod(values.at(0));
+		step.H_1 = std::stod(values.at(1));
+		step.H_2 = std::stod(values.at(2));
+		testSteps.push_back(step);
+	}
+	file.close();
+
+	simulation.timeLimit = testSteps.back().time;
+	simulation.startHeight1 = testSteps.front().H_1;
+	simulation.startHeight2 = testSteps.front().H_2;
+
+	bool keAdjusted = false;
+	simulation.canalContext.K_e = 0;
+	REAL lastMaxStepError = 0;
+	while (!keAdjusted)
+	{
+		RunCanalSimulation(simulation);
+
+		REAL maxStepError = 0;
+		size_t simulationStepIndex = 0;
+		for (size_t testStepIndex = 0; testStepIndex < testSteps.size(); testStepIndex++)
+		{
+			TEST_STEP testStep = testSteps.at(testStepIndex);
+			while (simulation.result.steps.at(simulationStepIndex).time < testStep.time)
+			{
+				simulationStepIndex++;
+			}
+			REAL stepError = abs(testStep.H_2 - simulation.result.steps.at(simulationStepIndex).H_2);
+			if (stepError > maxStepError)
+			{
+				maxStepError = stepError;
+			}
+		}
+
+		keAdjusted = simulation.canalContext.K_e > 0 && maxStepError > lastMaxStepError;
+		simulation.canalContext.K_e += 0.001;
+		lastMaxStepError = maxStepError;
+	}
+}
+
+void SaveResult(SIMULATION_CONTEXT& context, std::string fileName)
+{
+	std::fstream file;
+	std::vector<TEST_STEP> testSteps;
+	file.open(fileName, std::ios_base::out);
+	file << "k;" << context.result.k << "\n";
+	file << "f;" << context.canalContext.f << "\n";
+	file << "ke;" << context.canalContext.K_e << "\n";
+	file << "max H2;" << context.result.H_2_max << "\n";
+	REAL oscillationt = 0;
+	if (context.closeStartTime)
+	{
+		oscillationt = context.closeStartTime - context.openTime;
+	}
+	else
+	{
+		oscillationt = context.result.GetTotalTime() - context.openTime;
+	}
+	file << "oscillation t;" << oscillationt << "\n";
+	file << "\ntime;Q;H1;H2\n";
+	for each (auto step in context.result.steps)
+	{
+		if (floor(step.time) == step.time)
+		{
+			file << step.time << ";" << step.Q << ";" << step.H_1 << ";" << step.H_2 << "\n";
+		}
+	}
+	file.close();
 }
 
 int main()
@@ -315,15 +463,45 @@ int main()
 	canalContext.f = 0.02;
 	canalContext.K_e = 0;
 
+	printf("Run simulation 0...\n");
+	SIMULATION_CONTEXT simulation0;
+	simulation0.canalContext = canalContext;
+	simulation0.maxTruncationError = 0.01;
+	simulation0.maxOscillationAmplitude = 0.1;
+	simulation0.openTime = 240;
+	simulation0.startHeight1 = 18;
+	simulation0.startHeight2 = 0;
+	simulation0.startStep = 1;
+	RunCanalSimulation(simulation0);
+	SaveResult(simulation0, "simulation0.result.csv");
+
+	printf("Run simulation 1...\n");
 	SIMULATION_CONTEXT simulation1;
 	simulation1.canalContext = canalContext;
-	simulation1.maxTruncationError = 0.01;
-	simulation1.maxOscillationAmplitude = 0.1;
-	simulation1.openTime = 240;
-	simulation1.startHeight1 = 18;
-	simulation1.startHeight2 = 0;
-	simulation1.startStep = 1;
-	RunCanalSimulation(simulation1);
+	simulation1.startStep = simulation0.result.k;
+	RunKeAdjustment(simulation1, "simulation1.csv");
+	SaveResult(simulation1, "simulation1.result.csv");
+
+	printf("Run simulation 2...\n");
+	SIMULATION_CONTEXT simulation2;
+	simulation2.canalContext = canalContext;
+	simulation2.startStep = simulation0.result.k;
+	RunKeAdjustment(simulation2, "simulation2.csv");
+	SaveResult(simulation2, "simulation2.result.csv");
+
+	printf("Run simulation 3...\n");
+	SIMULATION_CONTEXT simulation3;
+	simulation3.canalContext = canalContext;
+	simulation3.startStep = simulation0.result.k;
+	RunKeAdjustment(simulation3, "simulation3.csv");
+	SaveResult(simulation3, "simulation3.result.csv");
+
+	printf("Run simulation 4...\n");
+	SIMULATION_CONTEXT simulation4;
+	simulation4.canalContext = canalContext;
+	simulation4.startStep = simulation0.result.k;
+	RunKeAdjustment(simulation4, "simulation4.csv");
+	SaveResult(simulation4, "simulation4.result.csv");
 
 	return 0;
 }
