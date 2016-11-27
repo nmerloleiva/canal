@@ -18,6 +18,7 @@
 #include <map>
 #include <fstream>
 #include <string>
+#include <iomanip>
 
 
 // Precision type abstraction.
@@ -25,6 +26,8 @@ typedef double REAL;
 #define REAL_MAX std::numeric_limits<REAL>::max()
 
 #define PANAMA_COCOLI_LOCKS_LATITUDE 8.985470
+#define MAX_OSCILATION_AMPLITUDE 0.1
+#define MAX_TRUNCATION_ERROR 0.01
 
 struct REAL_PAIR
 {
@@ -54,6 +57,7 @@ const auto Kv_table_size = sizeof(Kv_table) / sizeof(Kv_table[0]);
 struct SOLVE_CONTEXT
 {
 	REAL tap;
+	REAL t;
 	REAL k;
 	REAL H_1_n;
 	REAL H_2_n;
@@ -68,6 +72,13 @@ struct SOLVE_CONTEXT
 
 	REAL var_1;
 	REAL var_2;
+
+	REAL H_2_max;
+	REAL H_2_delta;
+	REAL H_2_osc_min;
+	REAL H_2_osc_max;
+	REAL H_1_truncation_error;
+	REAL H_2_truncation_error;
 };
 
 struct CANAL_CONTEXT
@@ -93,9 +104,13 @@ REAL ComputeKv(REAL openPercent)
 		else if ((i + 1) < Kv_table_size &&
 			openPercent < Kv_table[i + 1].first)
 		{
-			return Kv_table[i + 1].second;
+			REAL m = (Kv_table[i + 1].second - Kv_table[i].second) / Kv_table[i + 1].first - Kv_table[i].first;
+			REAL b = Kv_table[i].second;
+			return m * (openPercent - Kv_table[i].first) + b;
 		}
 	}
+
+	// openPercent > 1: return minimum Kv
 	return Kv_table[Kv_table_size - 1].second;
 }
 
@@ -145,26 +160,99 @@ int main()
 	solveContext.const_2 = canalContext.f / (2.0 * canalContext.D_e * canalContext.A);
 	solveContext.const_3 = canalContext.K_e / (2.0 * canalContext.A * canalContext.L);
 	solveContext.tap = 240;
-	solveContext.k = solveContext.tap / 10000;
-	solveContext.H_1_n = 18.0; // H_1_0
-	solveContext.H_2_n = 0.0; // H_2_0
-	solveContext.Q_n = 0.0; // Q_0
+	solveContext.k = 1;
 
-	for (REAL t = 0.0; t < solveContext.k * 10000000; t += solveContext.k)
+
+	std::fstream file;
+	std::string fileName = "simulationRun.txt";
+	file.open(fileName, std::ios_base::out);
+
+	bool truncationErrorBelowMax = false;
+	while (!truncationErrorBelowMax)
 	{
-		if (t <= solveContext.tap)
+		file << "Simulation start k=" << solveContext.k << "\n";
+		solveContext.t = 0;
+		solveContext.H_1_n = 18.0; // H_1_0
+		solveContext.H_2_n = 0.0; // H_2_0
+		solveContext.Q_n = 0.0; // Q_0
+		solveContext.H_2_delta = solveContext.H_2_n_1 - solveContext.H_2_n;
+
+		truncationErrorBelowMax = true;
+		bool openTimeHit = solveContext.t >= solveContext.tap;
+		bool oscillationHit = solveContext.H_1_n < solveContext.H_2_n;
+		bool stableOscillationHit = abs(solveContext.H_1_n - solveContext.H_2_n) < MAX_OSCILATION_AMPLITUDE;
+		while (truncationErrorBelowMax &&
+			(!openTimeHit ||
+			!oscillationHit ||
+			!stableOscillationHit))
 		{
-			REAL Kv_n = ComputeKv(t / solveContext.tap);
-			REAL Kv_n_1 = ComputeKv((t + solveContext.k) / solveContext.tap);
-			solveContext.var_1 = Kv_n / (2.0 * canalContext.A * canalContext.L);
-			solveContext.var_2 = Kv_n_1 / (2.0 * canalContext.A * canalContext.L);
+			if (solveContext.t <= solveContext.tap)
+			{
+				REAL Kv_n = ComputeKv(solveContext.t / solveContext.tap);
+				REAL Kv_n_1 = ComputeKv((solveContext.t + solveContext.k) / solveContext.tap);
+				solveContext.var_1 = Kv_n / (2.0 * canalContext.A * canalContext.L);
+				solveContext.var_2 = Kv_n_1 / (2.0 * canalContext.A * canalContext.L);
+			}
+
+			CanalSolveRK2Step(canalContext, solveContext);
+			
+			file << "Simulation step" << " t=" << std::setw(14) << solveContext.t << " H1=" << std::setw(14) << solveContext.H_1_n << " H2=" << std::setw(14) << solveContext.H_2_n << "\n";
+
+			REAL truncationErrorH_1 = abs(solveContext.H_1_n_1 - solveContext.H_1_n);
+			REAL truncationErrorH_2 = abs(solveContext.H_2_n_1 - solveContext.H_2_n);
+			if (truncationErrorH_1 > MAX_TRUNCATION_ERROR ||
+				truncationErrorH_2 > MAX_TRUNCATION_ERROR)
+			{
+				truncationErrorBelowMax = false;
+				solveContext.k /= 2;
+				file << "Simulation abort:" << " truncation error exceeded limit!" << " H1 error=" << truncationErrorH_1 << " H2 error=" << truncationErrorH_2 << "\n" << "\n";
+			}
+			else
+			{
+				truncationErrorBelowMax = true;
+			
+				if (!openTimeHit)
+				{
+					openTimeHit = solveContext.t >= solveContext.tap;
+				}
+				else
+				{
+					if (solveContext.H_2_n_1 > solveContext.H_2_max)
+					{
+						solveContext.H_2_max = solveContext.H_2_n_1;
+					}
+
+					if (solveContext.H_2_delta < 0 &&
+						solveContext.H_2_n_1 > solveContext.H_2_n)
+					{
+						solveContext.H_2_osc_min = solveContext.H_2_n;
+					}
+					else if (solveContext.H_2_delta > 0 && 
+						solveContext.H_2_n_1 < solveContext.H_2_n)
+					{
+						solveContext.H_2_osc_max = solveContext.H_2_n;
+					}
+
+					if (!oscillationHit)
+					{
+						oscillationHit = solveContext.H_2_osc_min > 0 && solveContext.H_2_osc_max > 0;
+					}
+					else 
+					{
+						stableOscillationHit = abs(solveContext.H_2_osc_max - solveContext.H_2_osc_min) < MAX_OSCILATION_AMPLITUDE;
+					}
+				}
+
+				solveContext.H_2_delta = solveContext.H_2_n_1 - solveContext.H_2_n;
+				solveContext.H_1_n = solveContext.H_1_n_1;
+				solveContext.H_2_n = solveContext.H_2_n_1;
+				solveContext.Q_n = solveContext.Q_n_1;
+				solveContext.t += solveContext.k;
+			}
 		}
-		CanalSolveRK2Step(canalContext, solveContext);
-		solveContext.H_1_n = solveContext.H_1_n_1;
-		solveContext.H_2_n = solveContext.H_2_n_1;
-		solveContext.Q_n = solveContext.Q_n_1;
 	}
 
-	getchar();
+	file << "Simulation completed!" << "\n";
+	file.close();
 	return 0;
 }
