@@ -186,6 +186,7 @@ REAL ComputeKv(REAL openPercent)
 		else if ((i + 1) < Kv_table_size &&
 			openPercent < Kv_table[i + 1].first)
 		{
+			// linear interpolation
 			REAL m = (Kv_table[i + 1].second - Kv_table[i].second) / Kv_table[i + 1].first - Kv_table[i].first;
 			REAL b = Kv_table[i].second;
 			return m * (openPercent - Kv_table[i].first) + b;
@@ -274,6 +275,7 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 	
 	simulation.result.Reset(solveContext.k);
 
+	int kDen = 1;
 	bool truncationErrorBelowMax = false;
 	while (!truncationErrorBelowMax)
 	{
@@ -323,13 +325,13 @@ void RunCanalSimulation(SIMULATION_CONTEXT& simulation)
 
 			if (simulation.maxTruncationError)
 			{
-				REAL truncationErrorH_1 = abs(solveContext.H_1_n_1 - solveContext.H_1_n);
-				REAL truncationErrorH_2 = abs(solveContext.H_2_n_1 - solveContext.H_2_n);
+				REAL truncationErrorH_1 = abs(solveContext.H_1_n_1 - solveContext.H_1_n) / solveContext.k - abs(solveContext.H_1_n);
+				REAL truncationErrorH_2 = abs(solveContext.H_2_n_1 - solveContext.H_2_n) / solveContext.k - abs(solveContext.H_2_n);
 				if (truncationErrorH_1 > simulation.maxTruncationError ||
 					truncationErrorH_2 > simulation.maxTruncationError)
 				{
 					truncationErrorBelowMax = false;
-					solveContext.k /= 10;
+					solveContext.k -= 0.001;
 					simulation.result.Reset(solveContext.k);
 				}
 				else
@@ -448,7 +450,21 @@ void RunKeAdjustment(SIMULATION_CONTEXT& simulation, std::string testFileName)
 			{
 				simulationStepIndex++;
 			}
-			REAL stepError = abs(testStep.H_2 - simulation.result.steps.at(simulationStepIndex).H_2);
+			REAL simulationH_2 = 0;
+			if (simulation.result.steps.at(simulationStepIndex).time == testStep.time)
+			{
+				simulationH_2 = simulation.result.steps.at(simulationStepIndex).H_2;
+			}
+			else
+			{
+				// linear interpolation
+				auto prevStep = simulation.result.steps.at(simulationStepIndex - 1);
+				auto nextStep = simulation.result.steps.at(simulationStepIndex);
+				REAL m = (nextStep.H_2 - prevStep.H_2) / (nextStep.time - prevStep.time);
+				REAL b = prevStep.H_2;
+				simulationH_2 = m * (testStep.time - prevStep.time) + b;
+			}
+			REAL stepError = abs(testStep.H_2 - simulationH_2);
 			if (stepError > maxStepError)
 			{
 				maxStepError = stepError;
@@ -483,10 +499,7 @@ void SaveResult(SIMULATION_CONTEXT& context, std::string fileName)
 	file << "\ntime;Q;H1;H2\n";
 	for each (auto step in context.result.steps)
 	{
-		if (floor(step.time) == step.time)
-		{
-			file << step.time << ";" << step.Q << ";" << step.H_1 << ";" << step.H_2 << "\n";
-		}
+		file << step.time << ";" << step.Q << ";" << step.H_1 << ";" << step.H_2 << "\n";
 	}
 	file.close();
 }
